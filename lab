@@ -1,0 +1,277 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torchvision
+import torchvision.transforms as transforms
+import torchvision.models as models
+from torch.utils.data import DataLoader, random_split
+
+import numpy as np
+import matplotlib.pyplot as plt
+import copy
+import os
+from tqdm import tqdm
+from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
+
+# 0. Սարքի ընտրություն (GPU եթե հասանելի է)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Օգտագործվող սարքը: {device}")
+
+# 1. Տվյալների մշակում (Advanced Data Augmentation & Normalization)
+# Օգտագործում ենք CIFAR-10-ի ճշգրիտ ստատիստիկան և AutoAugment/Random Erasing էֆեկտիվության համար
+transform_train = transforms.Compose([
+    transforms.Resize(224),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(15),
+    transforms.ToTensor(),
+    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+])
+
+transform_test = transforms.Compose([
+    transforms.Resize(224),
+    transforms.ToTensor(),
+    transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010))
+])
+
+# Բեռնում ենք dataset-ը PyTorch-ի միջոցով
+print("Տվյալների բեռնում...")
+full_train_dataset = torchvision.datasets.CIFAR10(root="./data", train=True, download=True, transform=transform_train)
+test_dataset = torchvision.datasets.CIFAR10(root="./data", train=False, download=True, transform=transform_test)
+
+# Train/Validation բաժանում (80% մարզում, 20% վալիդացիա)
+train_size = int(0.8 * len(full_train_dataset))
+val_size = len(full_train_dataset) - train_size
+train_data, val_data = random_split(full_train_dataset, [train_size, val_size])
+
+# Քանի որ random_split-ը պահում է նույն transform-ը, վալիդացիայի համար փոխում ենք թեստայինի
+val_data = copy.deepcopy(val_data)
+val_data.dataset.transform = transform_test
+
+classes = full_train_dataset.classes
+
+# Dataloaders
+batch_size = 64
+train_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, num_workers=2)
+val_loader = DataLoader(val_data, batch_size=batch_size, shuffle=False, num_workers=2)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+
+# 2. Մոդելի ստեղծման ֆունկցիա (ResNet50 / VGG16 ընտրություն)
+def get_fine_tuned_model(architecture="resnet50", dropout_rate=0.3):
+    if architecture == "resnet50":
+        # Օգտագործում ենք ResNet50 ավելի բարձր ճշտության (Benchmark) հասնելու համար
+        model = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+        
+        # Ֆայն-թյունինգի ռազմավարություն. սառեցնում ենք սկզբնական շերտերը, բացում վերջին 2 բլոկերը
+        for param in model.parameters():
+            param.requires_grad = False
+        for param in model.layer3.parameters():
+            param.requires_grad = True
+        for param in model.layer4.parameters():
+            param.requires_grad = True
+            
+        num_ftrs = model.fc.in_features
+        model.fc = nn.Sequential([
+            nn.Dropout(dropout_rate),
+            nn.Linear(num_ftrs, 10)
+        ])
+    elif architecture == "vgg16":
+        model = models.vgg16_bn(weights=models.VGG16_BN_Weights.DEFAULT)
+        for param in model.parameters():
+            param.requires_grad = False
+        # Բացում ենք միայն classifier մասը
+        for param in model.classifier.parameters():
+            param.requires_grad = True
+        num_ftrs = model.classifier[6].in_features
+        model.classifier[6] = nn.Linear(num_ftrs, 10)
+        
+    return model.to(device)
+
+# 3. Հիպերպարամետրերի որոնում (Hyperparameter Tuning - Օրինակ նոր պարամետրերով)
+# Փորձարկում ենք տարբեր օպտիմիզատորներ և սովորելու տեմպեր (Learning Rates)
+tuning_grid = [
+    {"lr": 1e-4, "optimizer": "AdamW", "dropout": 0.2},
+    {"lr": 3e-4, "optimizer": "AdamW", "dropout": 0.3},
+    {"lr": 1e-3, "optimizer": "SGD", "dropout": 0.3}
+]
+
+best_config = None
+best_val_acc = 0.0
+
+print("\n===== ՀԻՊԵՐՊԱՐԱՄԵՏՐԵՐԻ ՈՐՈՆՈՒՄ (Quick Run - 1 Epoch) =====")
+for config in tuning_grid:
+    print(f"Փորձարկում: Opt={config['optimizer']}, LR={config['lr']}, Dropout={config['dropout']}")
+    model = get_fine_tuned_model(architecture="resnet50", dropout_rate=config["dropout"])
+    criterion = nn.CrossEntropyLoss()
+    
+    if config["optimizer"] == "AdamW":
+        optimizer = optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=config["lr"], weight_decay=1e-4)
+    else:
+        optimizer = optim.SGD(filter(lambda p: p.requires_grad, model.parameters()), lr=config["lr"], momentum=0.9, weight_decay=5e-4)
+        
+    # 1 դարաշրջան արագ ստուգման համար
+    model.train()
+    for images, labels in tqdm(train_loader, desc="Մարզում", leave=False):
+        images, labels = images.to(device), labels.to(device)
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        
+    # Վալիդացիա
+    model.eval()
+    correct, total = 0, 0
+    with torch.no_grad():
+        for images, labels in val_loader:
+            images, labels = images.to(device), labels.to(device)
+            outputs = model(images)
+            _, predicted = torch.max(outputs, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+            
+    val_acc = 100 * correct / total
+    print(f"Validation Accuracy: {val_acc:.2f}%")
+    
+    if val_acc > best_val_acc:
+        best_val_acc = val_acc
+        best_config = config
+
+print(f"\nԼԱՎԱԳՈՒՅՆ ՀԱՄԱԴՐՈՒԹՅՈՒՆԸ: {best_config}")
+
+# 4. Վերջնական Մարզում Լավագույն Պարամետրերով
+print("\n===== ՎԵՐՋՆԱԿԱՆ ՄԱՐԶՈՒՄ =====")
+final_model = get_fine_tuned_model(architecture="resnet50", dropout_rate=best_config["dropout"])
+criterion = nn.CrossEntropyLoss()
+
+if best_config["optimizer"] == "AdamW":
+    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, final_model.parameters()), lr=best_config["lr"], weight_decay=1e-4)
+else:
+    optimizer = optim.SGD(filter(lambda p: p.requires_grad, final_model.parameters()), lr=best_config["lr"], momentum=0.9, weight_decay=5e-4)
+
+# Օգտագործում ենք CosineAnnealingLR սահուն օպտիմալացման համար
+scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=10)
+
+epochs = 10  # Կարող եք մեծացնել մինչև 20 լավագույն արդյունքի համար
+train_losses, val_losses = [], []
+train_accuracies, val_accuracies = [], []
+
+best_model_wts = copy.deepcopy(final_model.state_dict())
+best_accuracy = 0.0
+
+for epoch in range(epochs):
+    print(f"Epoch {epoch+1}/{epochs}")
+    
+    # Մարզման փուլ
+    final_model.train()
+    running_loss, correct, total = 0.0, 0, 0
+    
+    for images, labels in tqdm(train_loader, desc="Training Phase"):
+        images, labels = images.to(device), labels.to(device)
+        optimizer.zero_grad()
+        outputs = final_model(images)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        
+        running_loss += loss.item() * images.size(0)
+        _, predicted = outputs.max(1)
+        total += labels.size(0)
+        correct += predicted.eq(labels).sum().item()
+        
+    epoch_train_loss = running_loss / len(train_loader.dataset)
+    epoch_train_acc = 100.0 * correct / total
+    train_losses.append(epoch_train_loss)
+    train_accuracies.append(epoch_train_acc)
+    
+    # Վալիդացիայի փուլ
+    final_model.eval()
+    running_val_loss, correct, total = 0.0, 0, 0
+    
+    with torch.no_grad():
+        for images, labels in val_loader:
+            images, labels = images.to(device), labels.to(device)
+            outputs = final_model(images)
+            loss = criterion(outputs, labels)
+            
+            running_val_loss += loss.item() * images.size(0)
+            _, predicted = outputs.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+            
+    epoch_val_loss = running_val_loss / len(val_loader.dataset)
+    epoch_val_acc = 100.0 * correct / total
+    val_losses.append(epoch_val_loss)
+    val_accuracies.append(epoch_val_acc)
+    
+    scheduler.step()
+    
+    print(f"Train Loss: {epoch_train_loss:.4f} | Train Acc: {epoch_train_acc:.2f}%")
+    print(f"Val Loss: {epoch_val_loss:.4f} | Val Acc: {epoch_val_acc:.2f}%")
+    
+    # Պահպանում ենք լավագույն կշիռները
+    if epoch_val_acc > best_accuracy:
+        best_accuracy = epoch_val_acc
+        best_model_wts = copy.deepcopy(final_model.state_dict())
+
+# Բեռնում ենք լավագույն մոդելը վերջնական գնահատման համար
+final_model.load_state_dict(best_model_wts)
+
+# 5. Գրաֆիկների պատրաստում (Loss & Accuracy Plots)
+plt.figure(figsize=(12, 5))
+plt.subplot(1, 2, 1)
+plt.plot(train_losses, label='Train Loss', color='blue')
+plt.plot(val_losses, label='Validation Loss', color='orange')
+plt.title('Train vs Validation Loss')
+plt.xlabel('Epochs')
+plt.ylabel('Loss')
+plt.legend()
+
+plt.subplot(1, 2, 2)
+plt.plot(train_accuracies, label='Train Accuracy', color='blue')
+plt.plot(val_accuracies, label='Validation Accuracy', color='orange')
+plt.title('Train vs Validation Accuracy')
+plt.xlabel('Epochs')
+plt.ylabel('Accuracy (%)')
+plt.legend()
+plt.show()
+
+# 6. Մոդելի Գնահատում Թեստային Բազայի Վրա (Evaluation Report)
+final_model.eval()
+all_preds = []
+all_labels = []
+
+with torch.no_grad():
+    for images, labels in test_loader:
+        images = images.to(device)
+        outputs = final_model(images)
+        _, preds = torch.max(outputs, 1)
+        all_preds.extend(preds.cpu().numpy())
+        all_labels.extend(labels.numpy())
+
+# Precision, Recall, F1-score հաշվարկ
+print("\n===== ԳՆԱՀԱՏՄԱՆ ՀԱՇՎԵՏՎՈՒԹՅՈՒՆ (CLASSIFICATION REPORT) =====")
+print(classification_report(all_labels, all_preds, target_names=classes))
+
+# 7. Մոդելի Պահպանում (Save Model)
+model_save_path = "cifar10_resnet50_best.pth"
+torch.save(final_model.state_dict(), model_save_path)
+print(f"✔ Մոդելը հաջողությամբ պահպանվեց '{model_save_path}' ֆայլում:")
+
+
+print("\n===== INFERENCE ՕՐԻՆԱԿ (LOAD & PREDICT) =====")
+
+inference_model = get_fine_tuned_model(architecture="resnet50")
+
+inference_model.load_state_dict(torch.load(model_save_path))
+inference_model.eval()
+
+# Վերցնում ենք թեստային բազայից 1 պատկեր փորձարկման համար
+test_img, test_lbl = test_dataset[0]
+input_tensor = test_img.unsqueeze(0).to(device) # Ավելացնում ենք batch չափողականություն
+
+with torch.no_grad():
+    output = inference_model(input_tensor)
+    _, predicted_cls = torch.max(output, 1)
+    
+print(f"Իրական դասը: {classes[test_lbl]}")
+print(f"Մոդելի կանխատեսումը: {classes[predicted_cls.item()]}")
